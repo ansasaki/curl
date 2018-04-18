@@ -781,11 +781,13 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option,
 
         if(checkprefix("Set-Cookie:", argptr))
           /* HTTP Header format line */
-          Curl_cookie_add(data, data->cookies, TRUE, argptr + 11, NULL, NULL);
+          Curl_cookie_add(data, data->cookies, TRUE, FALSE, argptr + 11, NULL,
+                          NULL);
 
         else
           /* Netscape format line */
-          Curl_cookie_add(data, data->cookies, FALSE, argptr, NULL, NULL);
+          Curl_cookie_add(data, data->cookies, FALSE, FALSE, argptr, NULL,
+                          NULL);
 
         Curl_share_unlock(data, CURL_LOCK_DATA_COOKIE);
         free(argptr);
@@ -1037,6 +1039,7 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option,
      */
     data->set.socks5_gssapi_nec = (0 != va_arg(param, long)) ? TRUE : FALSE;
     break;
+#endif
 
   case CURLOPT_SOCKS5_GSSAPI_SERVICE:
   case CURLOPT_PROXY_SERVICE_NAME:
@@ -1046,10 +1049,7 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option,
     result = Curl_setstropt(&data->set.str[STRING_PROXY_SERVICE_NAME],
                             va_arg(param, char *));
     break;
-#endif
 
-#if !defined(CURL_DISABLE_CRYPTO_AUTH) || defined(USE_KERBEROS5) ||     \
-  defined(USE_SPNEGO)
   case CURLOPT_SERVICE_NAME:
     /*
      * Set authentication service name for DIGEST-MD5, Kerberos 5 and SPNEGO
@@ -1057,8 +1057,6 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option,
     result = Curl_setstropt(&data->set.str[STRING_SERVICE_NAME],
                             va_arg(param, char *));
     break;
-
-#endif
 
   case CURLOPT_HEADERDATA:
     /*
@@ -1601,6 +1599,13 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option,
      * Kludgy option to enable CRLF conversions. Subject for removal.
      */
     data->set.crlf = (0 != va_arg(param, long)) ? TRUE : FALSE;
+    break;
+
+  case CURLOPT_HAPROXYPROTOCOL:
+    /*
+     * Set to send the HAProxy Proxy Protocol header
+     */
+    data->set.haproxyprotocol = (0 != va_arg(param, long)) ? TRUE : FALSE;
     break;
 
   case CURLOPT_INTERFACE:
@@ -2553,6 +2558,9 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option,
     if(arg < 0)
       return CURLE_BAD_FUNCTION_ARGUMENT;
     data->set.happy_eyeballs_timeout = arg;
+    break;
+  case CURLOPT_DNS_SHUFFLE_ADDRESSES:
+    data->set.dns_shuffle_addresses = (0 != va_arg(param, long)) ? TRUE:FALSE;
     break;
   default:
     /* unknown tag and its companion, just ignore: */

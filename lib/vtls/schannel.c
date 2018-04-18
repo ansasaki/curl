@@ -92,6 +92,12 @@
 #endif
 #endif
 
+#ifdef UNICODE
+#define CURL_CERT_STORE_PROV_SYSTEM CERT_STORE_PROV_SYSTEM_W
+#else
+#define CURL_CERT_STORE_PROV_SYSTEM CERT_STORE_PROV_SYSTEM_A
+#endif
+
 #ifndef SP_PROT_SSL2_CLIENT
 #define SP_PROT_SSL2_CLIENT             0x00000008
 #endif
@@ -123,6 +129,9 @@
 /* Both schannel buffer sizes must be > 0 */
 #define CURL_SCHANNEL_BUFFER_INIT_SIZE   4096
 #define CURL_SCHANNEL_BUFFER_FREE_SIZE   1024
+
+#define CERT_THUMBPRINT_STR_LEN 40
+#define CERT_THUMBPRINT_DATA_LEN 20
 
 /* Uncomment to force verbose output
  * #define infof(x, y, ...) printf(y, __VA_ARGS__)
@@ -228,6 +237,56 @@ set_ssl_version_min_max(SCHANNEL_CRED *schannel_cred, struct connectdata *conn)
 }
 
 static CURLcode
+get_cert_location(TCHAR *path, DWORD *store_name, TCHAR **store_path,
+                  TCHAR **thumbprint)
+{
+  TCHAR *sep;
+  size_t store_name_len;
+
+  sep = _tcschr(path, TEXT('\\'));
+  if(sep == NULL)
+    return CURLE_SSL_CONNECT_ERROR;
+
+  store_name_len = sep - path;
+
+  if(_tcsnccmp(path, TEXT("CurrentUser"), store_name_len) == 0)
+    *store_name = CERT_SYSTEM_STORE_CURRENT_USER;
+  else if(_tcsnccmp(path, TEXT("LocalMachine"), store_name_len) == 0)
+    *store_name = CERT_SYSTEM_STORE_LOCAL_MACHINE;
+  else if(_tcsnccmp(path, TEXT("CurrentService"), store_name_len) == 0)
+    *store_name = CERT_SYSTEM_STORE_CURRENT_SERVICE;
+  else if(_tcsnccmp(path, TEXT("Services"), store_name_len) == 0)
+    *store_name = CERT_SYSTEM_STORE_SERVICES;
+  else if(_tcsnccmp(path, TEXT("Users"), store_name_len) == 0)
+    *store_name = CERT_SYSTEM_STORE_USERS;
+  else if(_tcsnccmp(path, TEXT("CurrentUserGroupPolicy"),
+                    store_name_len) == 0)
+    *store_name = CERT_SYSTEM_STORE_CURRENT_USER_GROUP_POLICY;
+  else if(_tcsnccmp(path, TEXT("LocalMachineGroupPolicy"),
+                    store_name_len) == 0)
+    *store_name = CERT_SYSTEM_STORE_LOCAL_MACHINE_GROUP_POLICY;
+  else if(_tcsnccmp(path, TEXT("LocalMachineEnterprise"),
+                    store_name_len) == 0)
+    *store_name = CERT_SYSTEM_STORE_LOCAL_MACHINE_ENTERPRISE;
+  else
+    return CURLE_SSL_CONNECT_ERROR;
+
+  *store_path = sep + 1;
+
+  sep = _tcschr(*store_path, TEXT('\\'));
+  if(sep == NULL)
+    return CURLE_SSL_CONNECT_ERROR;
+
+  *sep = 0;
+
+  *thumbprint = sep + 1;
+  if(_tcslen(*thumbprint) != CERT_THUMBPRINT_STR_LEN)
+    return CURLE_SSL_CONNECT_ERROR;
+
+  return CURLE_OK;
+}
+
+static CURLcode
 schannel_connect_step1(struct connectdata *conn, int sockindex)
 {
   ssize_t written = -1;
@@ -241,6 +300,7 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
   unsigned char alpn_buffer[128];
 #endif
   SCHANNEL_CRED schannel_cred;
+  PCCERT_CONTEXT client_certs[1] = { NULL };
   SECURITY_STATUS sspi_status = SEC_E_OK;
   struct curl_schannel_cred *old_cred = NULL;
   struct in_addr addr;
@@ -309,7 +369,7 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
       /* TODO s/data->set.ssl.no_revoke/SSL_SET_OPTION(no_revoke)/g */
       if(data->set.ssl.no_revoke)
         schannel_cred.dwFlags |= SCH_CRED_IGNORE_NO_REVOCATION_CHECK |
-                                 SCH_CRED_IGNORE_REVOCATION_OFFLINE;
+          SCH_CRED_IGNORE_REVOCATION_OFFLINE;
       else
         schannel_cred.dwFlags |= SCH_CRED_REVOCATION_CHECK_CHAIN;
 #endif
@@ -361,14 +421,70 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
       return CURLE_SSL_CONNECT_ERROR;
     }
 
+    /* client certificate */
+    if(data->set.ssl.cert) {
+      DWORD cert_store_name;
+      TCHAR *cert_store_path;
+      TCHAR *cert_thumbprint_str;
+      CRYPT_HASH_BLOB cert_thumbprint;
+      BYTE cert_thumbprint_data[CERT_THUMBPRINT_DATA_LEN];
+      HCERTSTORE cert_store;
+
+      TCHAR *cert_path = Curl_convert_UTF8_to_tchar(data->set.ssl.cert);
+      if(!cert_path)
+        return CURLE_OUT_OF_MEMORY;
+
+      result = get_cert_location(cert_path, &cert_store_name,
+                                 &cert_store_path, &cert_thumbprint_str);
+      if(result != CURLE_OK) {
+        Curl_unicodefree(cert_path);
+        return result;
+      }
+
+      cert_store = CertOpenStore(CURL_CERT_STORE_PROV_SYSTEM, 0,
+                                 (HCRYPTPROV)NULL,
+                                 cert_store_name, cert_store_path);
+      if(!cert_store) {
+        Curl_unicodefree(cert_path);
+        return CURLE_SSL_CONNECT_ERROR;
+      }
+
+      cert_thumbprint.pbData = cert_thumbprint_data;
+      cert_thumbprint.cbData = CERT_THUMBPRINT_DATA_LEN;
+
+      if(!CryptStringToBinary(cert_thumbprint_str, CERT_THUMBPRINT_STR_LEN,
+                              CRYPT_STRING_HEXRAW,
+                              cert_thumbprint_data, &cert_thumbprint.cbData,
+                              NULL, NULL)) {
+        Curl_unicodefree(cert_path);
+        return CURLE_SSL_CONNECT_ERROR;
+      }
+
+      client_certs[0] = CertFindCertificateInStore(
+        cert_store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+        CERT_FIND_HASH, &cert_thumbprint, NULL);
+
+      Curl_unicodefree(cert_path);
+
+      if(client_certs[0]) {
+        schannel_cred.cCreds = 1;
+        schannel_cred.paCred = client_certs;
+      }
+
+      CertCloseStore(cert_store, 0);
+    }
+
     /* allocate memory for the re-usable credential handle */
     BACKEND->cred = (struct curl_schannel_cred *)
-      malloc(sizeof(struct curl_schannel_cred));
+      calloc(1, sizeof(struct curl_schannel_cred));
     if(!BACKEND->cred) {
       failf(data, "schannel: unable to allocate memory");
+
+      if(client_certs[0])
+        CertFreeCertificateContext(client_certs[0]);
+
       return CURLE_OUT_OF_MEMORY;
     }
-    memset(BACKEND->cred, 0, sizeof(struct curl_schannel_cred));
     BACKEND->cred->refcount = 1;
 
     /* https://msdn.microsoft.com/en-us/library/windows/desktop/aa374716.aspx
@@ -379,6 +495,9 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
                                          &schannel_cred, NULL, NULL,
                                          &BACKEND->cred->cred_handle,
                                          &BACKEND->cred->time_stamp);
+
+    if(client_certs[0])
+      CertFreeCertificateContext(client_certs[0]);
 
     if(sspi_status != SEC_E_OK) {
       if(sspi_status == SEC_E_WRONG_PRINCIPAL)
@@ -466,12 +585,11 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
 
   /* allocate memory for the security context handle */
   BACKEND->ctxt = (struct curl_schannel_ctxt *)
-    malloc(sizeof(struct curl_schannel_ctxt));
+    calloc(1, sizeof(struct curl_schannel_ctxt));
   if(!BACKEND->ctxt) {
     failf(data, "schannel: unable to allocate memory");
     return CURLE_OUT_OF_MEMORY;
   }
-  memset(BACKEND->ctxt, 0, sizeof(struct curl_schannel_ctxt));
 
   host_name = Curl_convert_UTF8_to_tchar(hostname);
   if(!host_name)
@@ -1949,13 +2067,14 @@ static CURLcode Curl_schannel_md5sum(unsigned char *input,
     return CURLE_OK;
 }
 
-static void Curl_schannel_sha256sum(const unsigned char *input,
+static CURLcode Curl_schannel_sha256sum(const unsigned char *input,
                                     size_t inputlen,
                                     unsigned char *sha256sum,
                                     size_t sha256len)
 {
     Curl_schannel_checksum(input, inputlen, sha256sum, sha256len,
                            PROV_RSA_AES, CALG_SHA_256);
+    return CURLE_OK;
 }
 
 static void *Curl_schannel_get_internals(struct ssl_connect_data *connssl,
