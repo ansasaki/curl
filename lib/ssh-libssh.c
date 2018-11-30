@@ -2051,6 +2051,8 @@ static CURLcode myssh_connect(struct connectdata *conn, bool *done)
   struct Curl_easy *data = conn->data;
   int rc;
 
+  int verbosity = SSH_LOG_FUNCTIONS;
+
   /* initialize per-handle data if not already */
   if(!data->req.protop)
     myssh_setup_connection(conn);
@@ -2075,6 +2077,8 @@ static CURLcode myssh_connect(struct connectdata *conn, bool *done)
     failf(data, "Failure initialising ssh session");
     return CURLE_FAILED_INIT;
   }
+
+  ssh_options_set(ssh->ssh_session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
 
   if(conn->user) {
     infof(data, "User: %s\n", conn->user);
